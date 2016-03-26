@@ -1,0 +1,1297 @@
+#include <linux/kernel.h>
+#include "../../include/linux/printk.h"
+#include "../../include/linux/time.h"
+#include "../../include/net/cfg80211.h"
+#include <linux/slab.h>
+#include <linux/etherdevice.h>
+#include <linux/bitmap.h>
+#include <linux/rcupdate.h>
+#include <linux/export.h>
+#include <net/cfg80211.h>
+#include <linux/time.h>
+#include <linux/mutex.h>
+
+#include "../mac80211/ieee80211_i.h"
+#include "core.h"
+
+#include "rdev-ops.h"
+
+#include "algorithm.h"
+#define MAX_PKT_ALL 1000
+struct survey_info atlas_survey;
+EXPORT_SYMBOL(atlas_survey);
+
+unsigned int atlas_xretries;
+EXPORT_SYMBOL(atlas_xretries);
+
+unsigned int atlas_completed;
+EXPORT_SYMBOL(atlas_completed);
+
+unsigned int atlas_pkts_all;
+EXPORT_SYMBOL(atlas_pkts_all);
+
+extern unsigned long iperf_rate;
+extern int is_cw_forced;
+unsigned int n_completed, n_completed0, n_completed1;
+unsigned int n_pkts_all, n_pkts_all0, n_pkts_all1;
+unsigned int Tcompl;
+unsigned int n_rts_retries;
+unsigned int n_pkts_tot;
+unsigned int psucc;
+
+bool is_timer_started=false;
+struct timespec t0, t1;
+unsigned int n_retries,n_retries0,n_retries1;
+int D=0;
+int D2=0;
+unsigned int t_busy_driver=0;
+unsigned int perc_busy_drv=0;
+unsigned int t_busy=0;
+unsigned int t_retries=0;
+unsigned int perc_busy=0;
+unsigned int perc_pack=0;
+uint64_t n_frame=0;
+uint64_t n_frame_tot=0;
+uint64_t n_frame0,n_frame1;
+uint64_t delta_time=0;
+int64_t global_cw=-1;
+int64_t diff_tx=0;
+int64_t T_rts_retries=0;
+
+//lock-unlock the CW computation over busytime and psucc estimation
+unsigned int channel_stats_enable=1;
+
+
+struct survey_info survey0,survey1;
+struct survey_info diff_survey;
+//all state of algorithm
+
+struct state_header {
+    u8 mac[ETH_ALEN];
+    u8 closed;
+    u8 finished;
+    u8 offer;
+    u8 claim;
+    u8 w;
+    u8 status_bidd;
+    u8 status_auct;
+    u16 reserved;
+    u16 cw;
+} state_header;
+
+struct state_header state_header_vect[10]; 
+u8 			N = 1;
+int 			start_up = 0;
+int 			cont_frame_data = 0;
+int 			cont_frame_management = 0;
+
+struct 	timespec 	last_time, present_time, diff_time;
+
+long long 		mtime = 10;
+static 			struct timer_list wait_packet_timer;
+int 			update_claim_offer = 0;
+int 			yet_update_claim_offer = 0;
+
+u32 last_claim = 0;
+
+int debug = 1;
+int debug_tx = 1;
+  
+  
+  
+//to set a CW
+struct net_device *netdev = NULL;
+struct cfg80211_registered_device *rdev = NULL;
+
+
+#define UNIT			252
+#define MAX_THR			5140 //kbps
+#define tdata			2050 //transmission packet time us @6Mbps
+#define tack			39 // ACK us
+#define tpack		 	(tdata+tack) //us	
+#define SIFS			16	//us
+#define tslot			9	//us
+#define AIFS			2	//num
+#define DIFS			(AIFS*tslot+SIFS) //us
+#define IFS			(DIFS+SIFS) // DIFS+SIFIS us
+
+#define txT			(DIFS+tdata+SIFS+tack) //TxTime+DIFS+ACK+SIFS us
+
+#define trts			47 //us
+#define tcts			39 //us
+#define TxTime			(trts+tcts+tdata+tack+(3*SIFS)+DIFS)
+//#define psucc			0
+
+#define INTERVAL_W_NO_UPDATE 	10000
+#define DELTA_W 		30
+#define UP_LEVEL 		3200 //us
+#define DOWN_LEVEL 		987000 //us
+
+void packet_timer_callback( unsigned long data )
+{
+  int ret, rate, i;
+  rate=0;
+
+  printk( "atlas timer_callback called (%ld) - restore W value\n", jiffies );
+
+  if( abs(state_header_vect[0].w - rate) > DELTA_W) {
+			    //restart algorithm
+			    state_header_vect[0].finished=0;
+			    state_header_vect[0].closed=0;
+			    state_header_vect[0].offer = UNIT;
+			    state_header_vect[0].claim = 0;
+			    state_header_vect[0].cw = 32;
+	  
+			    for(i=1; i<N; i++){
+				state_header_vect[i].claim = 0;
+			    }
+			    
+			    
+			    update_claim_offer = 0;
+			    yet_update_claim_offer=0;
+			    
+			    state_header_vect[0].w = rate;
+
+			    atlas_offer();
+  }
+   
+  //restart timer for next 
+  ret = mod_timer( &wait_packet_timer, jiffies + msecs_to_jiffies(INTERVAL_W_NO_UPDATE) );
+  if (ret) printk("Error in mod_timer\n");
+   
+}
+
+
+void cleanup_atlas_algorithm( void )
+{
+	int ret;
+	//cleanup timer
+	ret = del_timer( &wait_packet_timer );
+	if (ret) printk("The timer is still in use...\n");
+	 
+	printk("Cleanup atlas algorithm and timer\n");
+
+	return;
+}
+
+
+
+
+void atlas_offer() {
+  
+		int i;
+  
+		//struct timeval t;
+		//struct tm broken;
+		int enable_status_debug = 0;
+		int active = 0;
+		u8 X = 0;
+		u8 claimed=0;
+		if(yet_update_claim_offer==0)
+			  enable_status_debug=1;
+
+  
+  
+	//************************************
+	//START ALGORITHM 2 AUCTIONER FOR NODE
+	//************************************
+	 
+	if( !(update_claim_offer%2) && yet_update_claim_offer==0){
+	 
+
+		//check if a message has been received from every bidder in B-active
+		int num_recvd = 0;
+		for(i=0; i<N; i++){
+			num_recvd = num_recvd + state_header_vect[i].status_bidd;
+		}
+ 
+		
+		if(num_recvd == N){
+				//debug
+				if(debug){
+				  printk("num_recvd %d\n", num_recvd);
+		  		  printk("*********OFFER ALGORITHM************\n");
+
+				  printk( "iperf_rate = %lu \n", iperf_rate);
+				}
+				if(debug && enable_status_debug){
+/*	
+					int i=0;
+					for (i=0; i<N; i++){
+						  //printk("mac address : %pM - \n", state_header_vect[i].mac);
+						  printk("before -> closed: %d - finished: %d - offer: %d - claim: %d\n", 
+							state_header_vect[i].closed, 
+							state_header_vect[i].finished, 
+							state_header_vect[i].offer*100/UNIT, 
+							state_header_vect[i].claim*100/UNIT);
+						  //printk("status_auct: %d - status_bidd: %d\n", state_header_vect[i].status_auct, state_header_vect[i].status_bidd);
+				}
+											    
+
+				printk("atlaslog");
+				do_gettimeofday(&t);
+				time_to_tm(t.tv_sec, 0, &broken);
+				//printk(",%d:12:%d:%d:%d:%d", broken.tm_year+1900,broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+				printk(",%ld:%d:%d:%d:%d:%d", broken.tm_year+1900, broken.tm_mon+1, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+
+
+					for (i=0; i<N; i++){
+							  printk(",%d,%d,%d,%d", 
+								state_header_vect[i].closed, 
+								state_header_vect[i].finished, 
+								state_header_vect[i].offer*100/UNIT, 
+								state_header_vect[i].claim*100/UNIT);
+					}
+					printk("\n");
+					printk("*********************************\n");	
+*/
+				}	
+		  
+		  
+			//look if at least a node is active
+			for (i=0; i<N; i++) {
+				if (state_header_vect[i].finished == 0) {
+					active++;
+					channel_stats_enable=1;
+				}
+			}
+			
+			
+			
+			//if al least node active run algorithm (2)
+			if(active > 0) {
+			  
+			  		
+					
+					//da considerare il caso in cui non arrivo qui perchè active vale 0
+					yet_update_claim_offer=1;
+
+			  
+					//we have received from every bidder
+					//reset status bidder
+					for(i=1; i<N; i++){
+						state_header_vect[i].status_bidd = 0;
+					}
+					
+					
+					X = 0;
+					//find X, sum of all claim for inactive node
+					for (i=0; i<N; i++) {
+						  if (state_header_vect[i].finished == 1) {
+							  X = X + state_header_vect[i].claim;
+						  }
+					}
+					
+					
+	//				if(active)
+						state_header_vect[0].offer = (UNIT-X)/active;
+	//  				else
+	//  					state_header_vect[0].offer = (UNIT-X);
+						
+					if(debug)
+						printk("value of X: %d - my offer : %d\n", X, state_header_vect[0].offer);
+				
+					claimed=0;
+					for (i=0; i<N; i++) {
+						claimed = claimed + state_header_vect[i].claim;
+					}
+					
+					if(debug)
+						printk("the claim sum: %d\n", claimed);
+				
+					if (claimed == UNIT) {
+						state_header_vect[0].closed=1;
+					}
+					else
+						state_header_vect[0].closed=0;
+					
+			
+			  
+					
+					
+					
+			}
+
+			
+		if(debug && enable_status_debug){
+/*	
+			int i=0;
+			for (i=0; i<N; i++){
+				  //printk("mac address : %pM - \n", state_header_vect[i].mac);
+				  printk("after -> closed: %d - finished: %d - offer: %d - claim: %d\n", 
+					state_header_vect[i].closed, 
+					state_header_vect[i].finished, 
+					state_header_vect[i].offer*100/UNIT, 
+					state_header_vect[i].claim*100/UNIT);
+				  //printk("status_auct: %d - status_bidd: %d\n", state_header_vect[i].status_auct, state_header_vect[i].status_bidd);
+			}
+			printk("atlaslog");
+			
+									    
+			do_gettimeofday(&t);
+			time_to_tm(t.tv_sec, 0, &broken);
+			printk(",%ld:%d:%d:%d:%d:%d", broken.tm_year+1900, broken.tm_mon+1, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+
+
+			for (i=0; i<N; i++){
+				  printk(",%d,%d,%d,%d", 
+					state_header_vect[i].closed, 
+					state_header_vect[i].finished, 
+					state_header_vect[i].offer*100/UNIT, 
+					state_header_vect[i].claim*100/UNIT);
+			}
+			printk("\n");
+			printk("*********************************\n");	
+*/
+		}	
+
+				
+		}
+
+
+	}
+		//************************************
+		// END ALGORITHM 2 AUCTIONER FOR NODE
+		//************************************
+	
+  
+  
+}
+
+
+void atlas_claim() {
+		int i;
+		int min = UNIT;
+		  
+		//struct timeval t;
+		//struct tm broken;
+		int enable_status_debug = 0;
+		int bottlenecked=0;
+		if(yet_update_claim_offer==0)
+			  enable_status_debug=1;
+
+  
+  
+      		//************************************
+		//START ALGORITHM 3 BIDDER FOR NODE
+		//************************************
+
+			
+		if( (update_claim_offer%2) && (yet_update_claim_offer==0) ){	
+			
+			//Update bidders, search min offer
+			//check if a message has been been received from all auctioneer in
+			int num_rec = 0;
+			//int num_finished = 0;
+			for(i=0; i<N; i++){
+				num_rec = num_rec + state_header_vect[i].status_bidd;
+			}
+			
+			// it time to respond with a claim
+			if(num_rec == N ){	
+			  	
+			    if(debug) {
+				printk("num_rec %d\n", num_rec);
+				printk("*********CLAIM ALGORITHM************\n");
+			    }
+			
+					if(debug && enable_status_debug){	
+/*
+					  int i=0;
+					  for (i=0; i<N; i++){
+							  //printk("mac address : %pM - \n", state_header_vect[i].mac);
+							  printk("before -> closed: %d - finished: %d - offer: %d - claim: %d\n", 
+								state_header_vect[i].closed, 
+								state_header_vect[i].finished, 
+								state_header_vect[i].offer*100/UNIT, 
+								state_header_vect[i].claim*100/UNIT);
+							  //printk("status_auct: %d - status_bidd: %d\n", state_header_vect[i].status_auct, state_header_vect[i].status_bidd);
+					}
+					printk("atlaslog");
+					
+											    
+						    do_gettimeofday(&t);
+						    time_to_tm(t.tv_sec, 0, &broken);
+						    printk(",%ld:%d:%d:%d:%d:%d", broken.tm_year+1900, broken.tm_mon+1, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+
+					for (i=0; i<N; i++){
+				  		  printk(",%d,%d,%d,%d", 
+							state_header_vect[i].closed, 
+							state_header_vect[i].finished, 
+							state_header_vect[i].offer*100/UNIT, 
+							state_header_vect[i].claim*100/UNIT);
+					}
+					printk("\n");
+					printk("*********************************\n");	
+*/
+					}	
+
+		  
+				  
+					//da considerare il caso in cui non arrivo qui perchè active vale 0
+					yet_update_claim_offer=1; 
+
+				  
+				  
+				  
+					//reset status_auct for other node
+					for(i=1; i<N; i++){
+						state_header_vect[i].status_bidd=0;
+					}	
+					
+					for (i=0; i<N; i++) {
+						if (state_header_vect[i].offer < min) {
+							min = state_header_vect[i].offer;
+						}
+					}
+					
+					
+					if(debug)
+					   printk("min of the offers : %d\n", min);
+					
+					if(state_header_vect[0].w < min) {
+						state_header_vect[0].claim = state_header_vect[0].w;
+					}
+					else {
+						state_header_vect[0].claim = min;
+					}
+
+					//check if someone have closed
+					bottlenecked=0;
+					for (i=0; i<N; i++) {
+						if (state_header_vect[i].closed==1) {
+							bottlenecked=1;
+							break;
+						}
+					}
+			
+					//check if I have closed
+					if(state_header_vect[0].claim == state_header_vect[0].w || bottlenecked)
+						state_header_vect[0].finished=1;
+					else
+						state_header_vect[0].finished=0;
+					
+					if(debug)
+					    printk("my finished : %d - my claim : %d -- \n", state_header_vect[0].finished, state_header_vect[0].claim);
+				
+			
+			if(debug && enable_status_debug){	
+/*
+						    int i=0;
+						    for (i=0; i<N; i++){
+							    //printk("mac address : %pM - \n", state_header_vect[i].mac);
+							    printk("after -> closed: %d - finished: %d - offer: %d - claim: %d\n", 
+									state_header_vect[i].closed, 
+									state_header_vect[i].finished, 
+									state_header_vect[i].offer*100/UNIT, 
+									state_header_vect[i].claim*100/UNIT);
+							    //printk("status_auct: %d - status_bidd: %d\n", state_header_vect[i].status_auct, state_header_vect[i].status_bidd);
+						    }
+						    printk("atlaslog");
+						    
+						    
+						    do_gettimeofday(&t);
+						    time_to_tm(t.tv_sec, 0, &broken);
+						    //printk(",%d:12:%d:%d:%d:%d", broken.tm_year+1900, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+						    printk(",%ld:%d:%d:%d:%d:%d", broken.tm_year+1900, broken.tm_mon+1, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+
+			    
+						    for (i=0; i<N; i++){
+							  printk(",%d,%d,%d,%d", state_header_vect[i].closed, state_header_vect[i].finished, state_header_vect[i].offer*100/UNIT, state_header_vect[i].claim*100/UNIT);
+						    }
+						    printk("\n");
+						    printk("*********************************\n");	
+
+*/
+			}
+				
+				
+			}
+		
+		}
+			//************************************
+			// END ALGORITHM 3 BIDDER FOR NODE
+			//************************************
+	
+  
+  
+}
+
+void cw_update2(int local_cw){
+	int ac,result;
+	unsigned int cwmin=15;
+	unsigned int cwmax=1023;
+	struct ieee80211_txq_params txq_params;
+	//\unsigned int claim = state_header_vect[0].claim;
+	if (global_cw != local_cw){
+		if (local_cw >=0 ){
+			cwmin=local_cw;
+			cwmax=local_cw;
+		}
+		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+			txq_params.ac = ac;
+			txq_params.txop = 0;
+			txq_params.cwmin = cwmin;
+			txq_params.cwmax = cwmax;
+			txq_params.aifs = 2;
+			result = rdev_set_txq_params(rdev, netdev, &txq_params);
+		}		
+		global_cw=local_cw;
+		//printk("claim: %u, cw_update: cwmin=%u, cwmax=%u,local_cw=%d\n",claim,cwmin,cwmax,local_cw);
+	}
+}
+EXPORT_SYMBOL(cw_update2);
+
+void cw_update(void){
+  		
+				
+#define MAX_CW	1023
+#define MIN_CW	15			
+#define SATURATION_CW 128
+#define Tslot 9 //us
+#define Payload 1470 //Byte
+	int j;
+	struct ieee80211_txq_params txq_params;
+	int ac, result;
+	int active = 0;
+	u32 cw=MIN_CW;
+	int claim_sum=0;
+	uint64_t num;
+	uint64_t den;
+   	//rwlock_t xxx_lock = __RW_LOCK_UNLOCKED(xxx_lock);
+
+	for (j=0; j<N; j++) {
+		if (state_header_vect[j].finished == 1) {
+			active++;
+		}
+	}
+	
+	if( active == N ){
+		printk("================= UPDATE CW ================\n");
+		for (j=0; j<N; j++){
+			claim_sum+=state_header_vect[j].claim;
+		}
+		
+		printk("claim_sum=%d\n",claim_sum);
+		printk("state_header_vect[0].claim=%d\n",state_header_vect[0].claim);
+/*
+		if (state_header_vect[0].claim == 0)
+			return;
+
+		if (claim_sum==UNIT){ //saturation
+			cw=128;
+		}else{
+			cw=2*txT/state_header_vect[0].claim*(UNIT-claim_sum)/Tslot;
+		}
+
+		if (cw > MAX_CW)
+			cw=MAX_CW;
+		if (cw < MIN_CW)
+			cw=MIN_CW;
+*/
+		//cw= 2*(Payload./(R/1e3.*claim)-TxTime)./Tslot;
+		
+		if (state_header_vect[0].claim == 0)
+			return;
+		
+		num=(uint64_t)( 2ULL*( (uint64_t)(Payload)*8ULL*1000ULL*(uint64_t)(UNIT)-(uint64_t)(txT)*((uint64_t)(MAX_THR)*(uint64_t)(state_header_vect[0].claim)) ) );
+//		num=2ULL*(1470ULL*8ULL*1000ULL*252ULL-2160ULL*5300ULL*95ULL);
+		den=(long long) ( (long long)Tslot*(long long)MAX_THR*(long long)state_header_vect[0].claim );
+		cw=num/den;
+		cw=192;
+		printk("cw=%u\n",cw);
+		//printk("num=%llu\n",num);
+		//printk("den=%llu\n",den);
+/*
+		if (cw > MAX_CW)
+			cw=MAX_CW;
+		if (cw < MIN_CW)
+			cw=MIN_CW;
+*/
+		printk("============================================\n");
+		if (state_header_vect[0].cw != cw){	
+			state_header_vect[0].cw=cw;
+			for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+				txq_params.ac = ac;
+				txq_params.txop = 0;
+				txq_params.cwmin = cw;
+				txq_params.cwmax = cw;
+				txq_params.aifs = 2;
+		
+			//write_lock_irqsave(&xxx_lock, netdev);
+				//.. read and write exclusive access to the info ...
+			result = rdev_set_txq_params(rdev, netdev, &txq_params);
+			
+			//write_unlock_irqrestore(&xxx_lock, netdev);
+			}
+		} else {
+			printk("cw is the same, no update\n");
+		}
+
+// 			   if(( (last_claim != state_header_vect[0].claim)) || (current_survey->read==0) ){
+// 				    
+// 				 
+// 				
+// 				    //update contentin window
+// 
+// 				    last_claim = (u32) state_header_vect[0].claim;
+// 				    current_survey->read = 1;
+// 			  
+// 				    u32 current_survey_diff_time = ((current_survey->diff_time.tv_sec * 1000000) + (current_survey->diff_time.tv_nsec / 1000)); 	//[us]
+// 				    
+// 				    u32 time_length = 3000;
+// 				    u32 claim_time = (last_claim * current_survey_diff_time) / UNIT ;
+// 				    u32 w_n = 0;
+// 				    u32 claim_num_frame = 0;
+// 				    u32 cw = 0;
+// 				    u32 time_slot_length = 9;
+// 
+// 				    
+// 				    if(claim_time != 0){
+// 					  if ( (current_survey->ratio_busy_scale + claim_time) < current_survey_diff_time){
+// 					      w_n = current_survey_diff_time - current_survey->ratio_busy_scale - claim_time;
+// 					      claim_num_frame = ( claim_time / time_length );
+// 					      cw = (w_n * 2) / (time_slot_length * claim_num_frame);
+// 					      
+// 					      if(cw>MAX_CW)
+// 						cw=MAX_CW;
+// 					      
+// 					  }
+// 					  else
+// 					      cw = SATURATION_CW;
+// 				    }
+// 				    else
+// 					cw = MAX_CW;
+// 
+// 				    				    
+// 				    printk("ack_good_count : %u -- ack_bad_count %u \n", current_survey->frame_ack_good_count, current_survey->frame_ack_bad_count);
+// 				    printk("claim %u - claim_time : %u -- busy %u -- diff_time_survey %u\n", last_claim, claim_time, current_survey->ratio_busy_scale, current_survey_diff_time);
+// 				    printk("w_n : %u -- cw %u\n",  w_n, cw);
+// 
+// 				    
+// 				    
+// 				    /*u32 w_1=0;
+// 				    u32 w_2=0;
+// 				    u32 w_3=0;
+// 				    *///u32 t_a = (2.2 * SCALE);
+// 				    //t_a = t_a / current_survey_diff_time; 	//[1 : 1000000] //2,2 is length packet at 6Mbps [1470byte]
+// 				    //u32 s_a = (last_claim * SCALE) / UNIT; 	//[1 : 1000000]
+// 				    //u32 s_a = (last_claim * current_survey_diff_time) / UNIT; 	//time activiti
+// 				    
+// // 				    u32 cw;
+// // 				    if (s_a == 0)
+// // 					cw = MAX_CW;
+// // 				    else{  
+// // 				      
+// // 					u32 framt_total_count = current_survey->frame_ack_good_count + current_survey->frame_ack_bad_count;
+// // 					u32 p_success =
+// // 				      
+// // 					w_1 = ((current_survey->frame_ack_good_count * t_a) * SCALE) / s_a; 	//[1 : 10000]
+// // 					
+// // 					if(w_1 > SCALE)
+// // 					  w_1 = SCALE;
+// // 					
+// // 					w_2 = ((current_survey->frame_ack_good_count + current_survey->frame_ack_bad_count) * t_a) ;
+// // 					w_3 = current_survey->ratio_busy_scale;
+// // 					
+// // 					if( (w_2+w_3) > w_1){ 
+// // 					  int i;
+// // 					  int total_other_claim = 0;
+// // 					  for(i=1; i<N; i++){
+// // 						total_other_claim = total_other_claim + state_header_vect[i].claim;
+// // 					  }
+// // 					  
+// // 					  if(total_other_claim < 40)
+// // 					    cw=MIN_CW;
+// // 					  else
+// // 					    cw=MAX_CW;
+// // 					}
+// // 					else{
+// // 					    cw = ( w_1 - w_2 - w_3); //2 * ( w_1 - w_2 - w_3)
+// // 					    cw = (cw * MAX_CW) / SCALE;
+// // 					}
+// // 				    }
+// 				    
+// 				    	
+//  				    struct ieee80211_txq_params txq_params;
+// 				    int ac, result;
+// 				    for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+// 					    txq_params.ac = ac;
+// 					    txq_params.txop = 0;
+// 					    txq_params.cwmin = cw;
+// 					    txq_params.cwmax = cw;
+// 					    txq_params.aifs = 2;
+// 					    result = rdev_set_txq_params(rdev, netdev, &txq_params);
+// 				    }
+// // 				    printk("current_survey->frame_ack_good_count : %u -- current_survey->frame_ack_bad_count %u \n", current_survey->frame_ack_good_count, current_survey->frame_ack_bad_count);
+// // 				    printk("claim : %u -- busy %u -- diff_time_survey %u -- t_a %u\n", s_a, current_survey->ratio_busy_scale, current_survey_diff_time, t_a);
+// // 				    printk("w_1 : %u -- w_2 %u -- w_3 %u -- cw %u\n",  w_1, w_2, w_3, cw);
+// 			  }
+	}	
+			
+			
+			
+			
+  
+  
+}
+
+
+int atlas_algorithm(struct atlas_header *atlas_header_point, int tx_rx, u8 * src, struct sk_buff *skb, int queue_depth, struct state_survey *current_survey) {
+	
+	int ret;
+  
+	struct timeval t;
+	struct tm broken;
+  
+    
+  
+  if(start_up == 0 && tx_rx == 0){
+	  //initializzation
+	  
+	  atlas_header_point->claim = 0;
+	  atlas_header_point->offer = 0;
+	  atlas_header_point->closed = 0;
+	  atlas_header_point->finished = 0;
+	  atlas_header_point->reserved = 0;
+	  state_header_vect[0].offer = atlas_header_point->offer;
+	  state_header_vect[0].claim = atlas_header_point->claim;
+	  state_header_vect[0].closed = atlas_header_point->closed;
+	  state_header_vect[0].finished = atlas_header_point->finished;
+	  state_header_vect[0].reserved = atlas_header_point->reserved;
+	  state_header_vect[0].status_auct = 1;
+	  state_header_vect[0].status_bidd = 1;
+	  state_header_vect[0].w = 0;
+	  
+	  
+	  //getnstimeofday(&last_time);
+	  //getnstimeofday(&present_time); 
+	  
+	/*  u8 check_mac_1[6] = {0x00, 0x15, 0x6d, 0x85, 0x90, 0x2d};
+	  u8 check_mac_2[6] = {0x00, 0x15, 0x6d, 0x85, 0x75, 0xb3};
+	  u8 check_mac_3[6] = {0xa8, 0x54, 0xb2, 0x69, 0x3b, 0xe3};
+	  
+	  if (!memcmp(check_mac_1, src, ETH_ALEN)){
+		state_header_vect[0].w = 200; //UNIT;
+	  }
+	  if (!memcmp(check_mac_2, src, ETH_ALEN)){
+		state_header_vect[0].w = 80; //UNIT;
+	  }
+	  if (!memcmp(check_mac_3, src, ETH_ALEN)){
+		state_header_vect[0].w = 160; //UNIT;
+	  }
+	  */
+	  
+	  memcpy(state_header_vect[0].mac, src, ETH_ALEN);
+
+	  //obtain dev device
+	  netdev = skb->dev;
+	  if (netdev ) {
+		rdev = wiphy_to_dev(netdev->ieee80211_ptr->wiphy);
+	  }
+	  
+	  
+	  printk ("inizializzazione = claim: %x -- offer: %x -- auction: %d -- bidder: %d\n", atlas_header_point->claim, state_header_vect[0].offer, atlas_header_point->closed, atlas_header_point->finished);
+	  
+	  //init timer for wait packet
+	  printk("Timer wait packet starting\n");
+	  setup_timer( &wait_packet_timer, packet_timer_callback, 0 );
+	  
+	  printk( "Starting timer to fire in 1s (%ld)\n", jiffies );
+	  ret = mod_timer( &wait_packet_timer, jiffies + msecs_to_jiffies(INTERVAL_W_NO_UPDATE) );
+	  if (ret) printk("Error in mod_timer\n");
+	  
+	  start_up = 1;
+	
+    }
+    else {
+	  
+	  
+	  //TX frame
+	  if (tx_rx == 0 && start_up == 1){
+
+		long rate = 0;
+		//long divider_data = 45;
+		//long divider_management = 4;
+		int pkt_max=30;
+		//int threshold = DELTA_W;
+		int i;
+		
+		//restart timer for next 
+		ret = mod_timer_pinned( &wait_packet_timer, jiffies + msecs_to_jiffies(INTERVAL_W_NO_UPDATE) );
+	
+		//considerate only the iperf frame
+/*
+		if( skb_get_queue_mapping(skb) == 2 )
+		{
+			//if( ( (queue_depth>35) && (queue_depth<45) ) || ((queue_depth>75))  ){
+			if(queue_depth>35) {
+				getnstimeofday(&last_time);
+				cont_frame_data=0;
+				cont_frame_management=0;
+			    
+				rate = UNIT;
+				//in questo momento aggiorniamo bidd a 0 (rifacciamo l'algoritmo) se la varizione di w è significativa, 
+				//la preoccupazione è che w si aggiorni più velocemente di quanto l'algoritmo possa convergere
+				if( abs(state_header_vect[0].w - rate) > DELTA_W) {
+				    //restart algorithm
+				    state_header_vect[0].finished=0;
+				    state_header_vect[0].closed=0;
+				    state_header_vect[0].offer = UNIT;
+				    state_header_vect[0].claim = 0;
+		  
+				    
+				     for(i=1; i<N; i++){
+					    state_header_vect[i].claim = 0;
+				     }
+				    
+				    update_claim_offer = 0;
+				    yet_update_claim_offer=0;
+				        
+				    state_header_vect[0].w = rate;
+				
+				    if(debug_tx)
+					printk("depth queue over 35,  chang val - " );
+				    
+				    if(debug_tx)
+					printk("=> w : %d\n", state_header_vect[0].w);   
+				}
+			}
+			else
+			    cont_frame_data++;
+		}
+		else
+		  cont_frame_management++;	
+		
+
+*/
+		/*
+		if(cont_frame_data == divider_data){
+						
+			//get current time
+			getnstimeofday(&present_time);
+			//compute difference
+			diff_time = timespec_sub(present_time, last_time);
+			
+			//save current time and reset count packet
+			getnstimeofday(&last_time);
+			cont_frame_data=0;
+			cont_frame_management=0;
+			
+			//convert to us
+			mtime = (((long long)diff_time.tv_sec * 1000000) + (diff_time.tv_nsec / 1000));
+			long mtime_2 = (long) mtime;
+			long rem = mtime_2 / divider_data;
+			long long time = (long long) rem;
+		
+			
+			if (debug_tx)
+				printk("#### ave. inter. time - %lldus - queue_depth %d - ", time, queue_depth);		
+			
+			//find rate
+			if (time > DOWN_LEVEL){		//us
+			      rate = 1;
+			}
+			else if (time < UP_LEVEL){		//us
+			      rate = UNIT;
+			}
+			else {
+				rate = (((UNIT*10000)/(long)time)*UP_LEVEL)/10000;
+			}
+			rate = (iperf_rate*UNIT)/MAX_THR;
+				
+			if ( state_header_vect[0].w < 200 )
+			    threshold = DELTA_W;
+			else
+			    threshold = DELTA_W + 20;
+
+			
+			//in questo momento aggiorniamo bidd a 0 (rifacciamo l'algoritmo) se la varizione di w è significativa, 
+			//la preoccupazione è che w si aggiorni più velocemente di quanto l'algoritmo possa convergere
+			if( abs(state_header_vect[0].w - rate) > threshold) {
+			    //restart algorithm
+			    state_header_vect[0].finished=0;
+			    state_header_vect[0].closed=0;
+			    state_header_vect[0].offer = UNIT;
+			    state_header_vect[0].claim = 0;
+	  
+			    for(i=1; i<N; i++){
+				state_header_vect[i].claim = 0;
+			    }
+			    
+			    
+			    update_claim_offer = 0;
+			    yet_update_claim_offer=0;
+			    if(debug_tx)
+				printk("chang val - ");
+			    
+			    state_header_vect[0].w = rate;
+			    
+			}
+			
+			if(debug_tx)
+				printk("=> w : %d\n", state_header_vect[0].w);
+			
+		}
+		//else if(cont_frame_management > divider_management)
+		
+
+		if(cont_frame_management > divider_management)
+		{
+			rate=0;
+			cont_frame_data=0;
+			cont_frame_management=0;
+			
+			if( abs(state_header_vect[0].w - rate) > threshold) {
+			    //restart algorithm
+			    state_header_vect[0].finished=0;
+			    state_header_vect[0].closed=0;
+			    state_header_vect[0].offer = UNIT;
+			    state_header_vect[0].claim = 0;
+	  
+			    for(i=1; i<N; i++){
+				state_header_vect[i].claim = 0;
+			    }
+			    
+			    update_claim_offer = 0;
+			    yet_update_claim_offer=0;
+	
+			    if(debug_tx)
+				printk("chang val from management frame - \n");
+			    
+			    state_header_vect[0].w = rate;
+			}
+
+		}
+		
+*/
+		rate = min((long)( UNIT ),(long)( (iperf_rate*UNIT)/MAX_THR) );
+		if(cont_frame_management > pkt_max)
+		{
+			cont_frame_management=0;
+			if(state_header_vect[0].w != rate)  {
+			    //restart algorithm
+			    state_header_vect[0].finished=0;
+			    state_header_vect[0].closed=0;
+			    state_header_vect[0].offer = UNIT;
+			    state_header_vect[0].claim = 0;
+	  
+			    for(i=1; i<N; i++){
+				state_header_vect[i].claim = 0;
+			    }
+			    
+			    update_claim_offer = 0;
+			    yet_update_claim_offer=0;
+			    state_header_vect[0].w = rate;
+			}
+
+		}else{
+			cont_frame_management++;
+		}
+		atlas_offer();		
+		atlas_claim();
+
+		printk("atlaslog");						  				    
+		do_gettimeofday(&t);
+		time_to_tm(t.tv_sec, 0, &broken);
+		//printk(",%d:12:%d:%d:%d:%d", broken.tm_year+1900, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+		printk(",%ld:%d:%d:%d:%d:%d", broken.tm_year+1900, broken.tm_mon+1, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+			    
+		for (i=0; i<N; i++){
+			printk(",%d,%d,%d,%d", state_header_vect[i].closed, state_header_vect[i].finished, state_header_vect[i].offer*100/UNIT, state_header_vect[i].claim*100/UNIT);
+		}
+		printk("\n");
+			
+		//cw update
+		atlas_rate_limiter();	
+		if ( true ) {
+		printk("atlas_stats: ---------------------------------------\n");
+/*		printk("atlas_stats: delta_time=%llu\n", delta_time);
+		printk("atlas_stats: claim=%u (%u)\n",state_header_vect[0].claim,100*state_header_vect[0].claim/252);
+		printk("atlas_stats: finished=%u\n", state_header_vect[0].finished);
+		printk("atlas_stats: closed=%u\n", state_header_vect[0].closed);
+		//printk("atlas_stats: n_frame_tot=%llu\n", n_frame_tot);
+		printk("atlas_stats: channel_busy_time=%llu (%u%) \n",diff_survey.channel_time_busy*1000, perc_busy_drv);
+		//printk("atlas_stats: diff_survey.channel_time_rx=%llu\n",diff_survey.channel_time_rx);
+		printk("atlas_stats: t_busy=%d (%u%)\n", t_busy,perc_busy);
+		printk("atlas_stats: D=%d\n", D);
+		printk("atlas_stats: D2=%d\n", D2);
+*/		//printk("atlas_stats: atlas_tx_pkts_all=%u\n", atlas_tx_pkts_all);
+		printk("atlas_stats: claim=%u (%u)\n",state_header_vect[0].claim,100*state_header_vect[0].claim/252);
+		printk("atlas_stats: finished=%u\n", state_header_vect[0].finished);
+		printk("atlas_stats: t_busy=%d - %u%\n", t_busy,perc_busy);
+		printk("atlas_stats: diff_survey.channel_time =%llu\n",diff_survey.channel_time*1000);
+		printk("atlas_stats: diff_survey.channel_time_tx=%llu\n",diff_survey.channel_time_tx*1000);
+		printk("atlas_stats: diff_survey.channel_time_rx =%llu\n",diff_survey.channel_time_rx*1000);
+		printk("atlas_stats: diff_tx =%llu\n",diff_tx);
+		printk("atlas_completed=%d\n", atlas_completed);
+		printk("atlas_pkts_all=%d\n", atlas_pkts_all);
+		printk("n_completed=%d\n", n_completed);
+		printk("n_pkts_all=%d\n", n_pkts_all);
+		printk("is_cw_forced=%d\n", is_cw_forced);
+		printk("channel_stats_enable=%d\n", channel_stats_enable);
+
+                //printk("Tcompl=%d\n", Tcompl);
+                printk("n_rts_retries=%d\n", n_rts_retries);
+                printk("n_pkts_tot=%d\n", n_pkts_tot);
+
+		printk("psucc=%d\n", psucc);
+		printk("atlas_stats: global_cw=%lld\n", global_cw);
+		printk("atlas_stats: ---------------------------------------\n");
+		}
+		printk("atlaslog_cw");
+		do_gettimeofday(&t);
+		time_to_tm(t.tv_sec, 0, &broken);
+		printk(",%ld:%d:%d:%d:%d:%d", broken.tm_year+1900, broken.tm_mon+1, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
+		printk(",%llu,%u,%u,%u,%d,%d,%lld,%d\n",
+			delta_time,
+			100*state_header_vect[0].claim/252,
+			state_header_vect[0].finished,
+			state_header_vect[0].closed,
+			t_busy,
+			D2,
+			global_cw,
+			psucc
+		);
+		atlas_header_point->offer = state_header_vect[0].offer;
+		atlas_header_point->claim = state_header_vect[0].claim;
+		atlas_header_point->closed = state_header_vect[0].closed;
+		atlas_header_point->finished = state_header_vect[0].finished;
+		
+		//state_header_vect[0].reserved++;
+		//atlas_header_point->reserved = state_header_vect[0].reserved;
+		atlas_header_point->reserved = 0;
+		
+		if(yet_update_claim_offer==1){
+			update_claim_offer++;
+			yet_update_claim_offer=0;
+		}
+	
+	}
+
+
+	
+	
+		
+	
+	//RX frame	
+	if (tx_rx == 1 && start_up == 1){
+	  
+	
+	 int i = 0;
+	 int j = 0; 
+	 int count;
+
+	  
+	   
+		// ***************************
+		//search if the receive station is present
+		//and update claim
+		// **************************
+		count=0;
+		for (i=0; i<N; i++){
+		      //found station, update value
+		      if (!memcmp(state_header_vect[i].mac, src, ETH_ALEN)){
+				  
+			
+			  if(  state_header_vect[i].finished && !atlas_header_point->finished){
+			   
+			    //if(  state_header_vect[i].closed && !atlas_header_point->closed){
+			    	  
+				  state_header_vect[0].finished=0;
+				  //state_header_vect[0].closed=0;
+				  //state_header_vect[0].offer = UNIT;
+				  //state_header_vect[0].claim = 0;
+	  
+				  for(j=0; j<N; j++){
+				      state_header_vect[j].claim = 0;
+				  }
+			    
+				  update_claim_offer = 0;
+				  yet_update_claim_offer=0;
+			    //}
+			  }
+			  
+			  state_header_vect[i].closed = atlas_header_point->closed;
+			  state_header_vect[i].finished = atlas_header_point->finished;
+			  state_header_vect[i].claim = atlas_header_point->claim;
+			  state_header_vect[i].offer = atlas_header_point->offer;
+			  
+			  //state_header_vect[i].status_auct = 1;
+			  state_header_vect[i].status_bidd = 1;
+			  
+			  
+//  			  printk("receive frame from : %pM - reserved %d\n", src, atlas_header_point->reserved);
+// 			  printk("*********RECEIVE************\n");
+// 					  int i=0;
+// 					  for (i=0; i<N; i++){
+// 							  //printk("mac address : %pM - \n", state_header_vect[i].mac);
+// 							  printk("closed: %d - finished: %d - offer: %d - claim: %d - \n", state_header_vect[i].closed, state_header_vect[i].finished, state_header_vect[i].offer, state_header_vect[i].claim);
+// 							 // printk("reserved %d\n", state_header_vect[i].reserved);
+// 					  }
+// 					  printk("*********************************\n");	
+// 						
+			  
+			  
+			  break;
+		      }
+		      count++;
+		}  
+		
+		
+		
+		
+		//printk("count: %d\n", count);
+		//if station don't found, we insert new station and set claim
+		if (count == N){
+		  memcpy(state_header_vect[N].mac, src, ETH_ALEN);
+		  state_header_vect[N].closed = atlas_header_point->closed;
+		  state_header_vect[N].finished = atlas_header_point->finished;
+		  state_header_vect[N].offer = atlas_header_point->offer;
+		  state_header_vect[N].claim = atlas_header_point->claim;
+		  //state_header_vect[N].reserved = atlas_header_point->reserved;
+		  
+		  //state_header_vect[N].status_auct = 1;
+		  state_header_vect[N].status_bidd = 1;
+		  N++;
+		  
+		  // update my offer with new node number
+		  // int
+		  state_header_vect[0].offer =  UNIT;
+		  //printk("init my offer value: %d\n", state_header_vect[0].offer);
+		}
+			
+		
+	} 
+	
+
+  }
+	
+      return 0;
+}
+	
+EXPORT_SYMBOL(atlas_algorithm);
+
+int atlas_rate_limiter(void){
+	uint8_t claim,finished;
+	//uint32_t payload=1470*8;
+	uint64_t dt=0;
+	struct timespec t_diff;	
+	uint64_t  T =3*1000*1000LLU; //usec
+	int local_cw=-1;
+	//atlas rate limiter
+	if (!is_timer_started){
+		is_timer_started=true;
+		getnstimeofday(&t0);
+		n_retries0=atlas_xretries;
+		survey0=atlas_survey;
+		n_completed0=atlas_completed;
+		n_pkts_all0=atlas_pkts_all;
+	}
+
+	getnstimeofday(&t1); 
+	//n_frame1=atlas_tx_pkts_all;
+	survey1=atlas_survey;
+	n_retries1=atlas_xretries;
+
+	n_completed1=atlas_completed;
+	n_pkts_all1=atlas_pkts_all;
+
+	n_frame++;
+	t_diff = timespec_sub(t1, t0);
+	dt=(long long)t_diff.tv_sec*1000000+(long long)t_diff.tv_nsec/1000;
+
+//	n_completed=n_completed1-n_completed0;
+//	n_pkts_all=n_pkts_all1-n_pkts_all0;
+	if ( (dt >= T) ) {
+	//if ( n_pkts_all > MAX_PKT_ALL ){
+
+		n_retries=n_retries1-n_retries0;
+		diff_survey.channel_time_busy = survey1.channel_time_busy - survey0.channel_time_busy;
+		diff_survey.channel_time_tx = survey1.channel_time_tx - survey0.channel_time_tx;
+		diff_survey.channel_time = survey1.channel_time - survey0.channel_time;
+		diff_survey.channel_time_rx = survey1.channel_time_rx - survey0.channel_time_rx;
+
+		n_completed=n_completed1-n_completed0;
+		n_pkts_all=n_pkts_all1-n_pkts_all0;
+		//if (n_pkts_all > 0)
+		//	psucc=((n_completed/n_pkts_all)*100;
+		perc_busy_drv=diff_survey.channel_time_busy*1000*100/dt;
+		n_frame_tot=(n_frame-1);
+		diff_tx=(diff_survey.channel_time - diff_survey.channel_time_rx)*1000;
+                //Tcompl=(trts+tdata+DIFS+3*SIFS)*n_completed;
+		//n_rts_retries=(diff_survey.channel_time_tx*1000 - Tcompl)/trts;
+		//n_rts_retries=(diff_tx - Tcompl)/trts;
+		n_rts_retries = (1000*diff_survey.channel_time - 1000*diff_survey.channel_time_rx - 1000*diff_survey.channel_time_tx - 1000*diff_survey.channel_time_tx*(trts+tcts+tack)/tdata)/trts;
+		
+		n_pkts_tot=n_completed + n_rts_retries;
+		/*
+		if (n_pkts_tot > 0)
+			psucc=((n_completed*100)/n_pkts_tot);
+		*/
+		//if (diff_survey.channel_time > 0)
+			//psucc=((diff_survey.channel_time_tx*100)/diff_survey.channel_time);
+		if (diff_tx > 0)
+			//psucc=((diff_survey.channel_time_tx*100*1000)/(n_completed*(tdata+trts+3*SIFS+DIFS)));
+			psucc=(diff_survey.channel_time_tx*100*1000)/diff_tx;
+
+		delta_time=dt;
+		t_busy = diff_survey.channel_time_busy*1000 - diff_survey.channel_time_tx*1000;
+		//t_busy = diff_survey.channel_time_busy*1000 - diff_tx;
+		perc_busy=(t_busy)*100/dt;
+			
+	}
+
+	claim = state_header_vect[0].claim;
+	finished = state_header_vect[0].finished;
+
+	if (finished==1){	
+		channel_stats_enable=0;
+		if (claim!=0){
+//			D = (100-perc_busy)*( txT )*UNIT/(100*claim);
+//			local_cw = 2*( D - (txT) ) / tslot;
+			D = (100-perc_busy)*(TxTime)*UNIT/(100*claim);
+			local_cw = 2*(((D - (tdata+tcts+tack+3*(SIFS)))*psucc)/100 - (trts+DIFS))/tslot;
+			printk("local_cw=%d\n", local_cw);
+
+			if (local_cw < 0)	
+				local_cw=0;
+
+			if (local_cw >= 1023)
+				D2 = (local_cw-1023)*tslot/2+txT;
+			else 
+				D2=-1;
+
+
+			if (local_cw > 1023)
+				local_cw=1023;
+			if (local_cw < 15)
+				local_cw=15;
+		}else{
+			D=-1;
+			D2=-1;
+			local_cw=-1;
+				
+		}
+		
+
+	}else{
+		channel_stats_enable=1;
+	}
+	if (D2 > 0)	
+		udelay(D2);
+	if (is_cw_forced < 0){
+	//if ( (is_cw_forced < 0) && (channel_stats_enable==0) ){
+		cw_update2(local_cw);
+	}
+	if( dt >= T ){ 
+	//if ( n_pkts_all > MAX_PKT_ALL ){
+		n_frame=0;
+		n_retries0=n_retries1;
+		t0=t1;
+		survey0=survey1;
+		n_completed0=n_completed1;
+		n_pkts_all0=n_pkts_all1;
+	}
+	return D;
+}

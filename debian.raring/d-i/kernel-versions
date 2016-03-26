@@ -1,0 +1,9 @@
+# arch	version		flavour		installedname			suffix	bdep
+amd64	3.8.0-37	generic		3.8.0-37-generic		-	
+
+i386	3.8.0-37	generic		3.8.0-37-generic		-	
+
+armhf	3.8.0-37	generic	3.8.0-37-generic		-
+
+# Ports
+# arch	version		flavour		installedname			suffix	bdep
